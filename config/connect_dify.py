@@ -1,18 +1,54 @@
 '''
 Author: JimZhang
 Date: 2026-04-09 02:18:35
-LastEditors: 很拉风的James
-LastEditTime: 2026-04-09 02:19:38
+LastEditors: JimZhang
+LastEditTime: 2026-04-09 13:27:00
 FilePath: /changshun_dify_test/config/connect_dify.py
-Description: 
-
 '''
 import requests
 import json
 from .config import logger
 
+
+def deep_parse_json_values(obj):
+    """递归展开嵌套的 JSON 字符串值"""
+    if isinstance(obj, dict):
+        return {k: deep_parse_json_values(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [deep_parse_json_values(item) for item in obj]
+    elif isinstance(obj, str):
+        s = obj.strip()
+        if (s.startswith('{') and s.endswith('}')) or \
+           (s.startswith('[') and s.endswith(']')):
+            try:
+                return deep_parse_json_values(json.loads(s))
+            except (json.JSONDecodeError, ValueError):
+                pass
+    return obj
+
+
+def _parse_sse_lines(resp):
+    """从 SSE 响应中逐行解析 JSON 数据"""
+    for line in resp.iter_lines():
+        if not line:
+            continue
+        decoded = line.decode('utf-8')
+        if not decoded.startswith("data: "):
+            continue
+        try:
+            yield json.loads(decoded[6:])
+        except json.JSONDecodeError:
+            pass
+
+
+def _log_node(title, outputs):
+    logger.info(f"  节点 -> [{title}]")
+    logger.debug(f"  [{title}] 输出:\n{json.dumps(outputs, ensure_ascii=False, indent=2)}")
+
+
 class DifyWorkflowTester:
-    def __init__(self, api_key: str, base_url: str = "https://api.dify.ai/v1"):
+
+    def __init__(self, api_key, base_url="https://api.dify.ai/v1"):
         self.api_key = api_key
         self.base_url = base_url.rstrip('/')
         self.headers = {
@@ -20,64 +56,115 @@ class DifyWorkflowTester:
             "Content-Type": "application/json"
         }
 
-    def run_workflow(self, inputs: dict, user_id: str = "test-user"):
-        endpoint = f"{self.base_url}/workflows/run"
-        
-        # 强制使用 streaming 来捕捉流程中每个节点的独立输出
+    def run(self, inputs, user_id="test-user"):
         payload = {
             "inputs": inputs,
             "response_mode": "streaming",
             "user": user_id
         }
-
         try:
-            response = requests.post(
-                endpoint, 
-                headers=self.headers, 
-                json=payload, 
-                stream=True
+            resp = requests.post(
+                f"{self.base_url}/workflows/run",
+                headers=self.headers, json=payload, stream=True
             )
-            response.raise_for_status() 
+            resp.raise_for_status()
 
             traces = []
             final_outputs = {}
 
-            logger.info("开始追踪工作流节点...")
-            for line in response.iter_lines():
-                if line:
-                    decoded_line = line.decode('utf-8')
-                    if decoded_line.startswith("data: "):
-                        data_str = decoded_line[6:]
-                        try:
-                            data_json = json.loads(data_str)
-                            event = data_json.get("event")
-                            
-                            # 拦截中间节点
-                            if event == "node_finished":
-                                node_data = data_json.get("data", {})
-                                node_title = node_data.get("title", node_data.get("node_type", "Unknown_Node"))
-                                node_outputs = node_data.get("outputs", {})
-                                
-                                traces.append({
-                                    "node": node_title,
-                                    "output": node_outputs
-                                })
-                                logger.info(f" 节点追踪 -> [{node_title}] 输出: {json.dumps(node_outputs, ensure_ascii=False)}")
-                                
-                            # 拦截最终整体完成事件
-                            elif event == "workflow_finished":
-                                final_outputs = data_json.get("data", {}).get("outputs", {})
-                                logger.info(f"工作流全部执行完成")
-                        except json.JSONDecodeError:
-                            pass
-            
-            return {
-                "data": {"outputs": final_outputs},
-                "traces": traces
-            }
+            for data in _parse_sse_lines(resp):
+                event = data.get("event")
+                if event == "node_finished":
+                    nd = data.get("data", {})
+                    title = nd.get("title", nd.get("node_type", "Unknown"))
+                    outputs = deep_parse_json_values(nd.get("outputs", {}))
+                    traces.append({"node": title, "output": outputs})
+                    _log_node(title, outputs)
+                elif event == "workflow_finished":
+                    final_outputs = data.get("data", {}).get("outputs", {})
+
+            return {"data": {"outputs": final_outputs}, "traces": traces}
 
         except requests.exceptions.RequestException as e:
-            logger.error(f"请求失败: {e}")
-            if e.response is not None:
-                logger.error(f"服务器返回信息: {e.response.text}")
+            logger.error(f"Workflow 请求失败: {e}")
             return None
+
+    def run_workflow(self, inputs, user_id="test-user"):
+        return self.run(inputs=inputs, user_id=user_id)
+
+
+class DifyChatflowTester:
+
+    def __init__(self, api_key, base_url="https://api.dify.ai/v1"):
+        self.api_key = api_key
+        self.base_url = base_url.rstrip('/')
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+    def run(self, query, inputs=None, user_id="abc-123", conversation_id=""):
+        payload = {
+            "inputs": inputs or {},
+            "query": query,
+            "response_mode": "streaming",
+            "conversation_id": conversation_id,
+            "user": user_id,
+            "files": []
+        }
+        try:
+            resp = requests.post(
+                f"{self.base_url}/chat-messages",
+                headers=self.headers, data=json.dumps(payload), stream=True
+            )
+            resp.raise_for_status()
+
+            traces = []
+            answer_parts = []
+            result_cid = conversation_id
+
+            for data in _parse_sse_lines(resp):
+                event = data.get("event")
+
+                if event == "node_finished":
+                    nd = data.get("data", {})
+                    title = nd.get("title", nd.get("node_type", "Unknown"))
+                    outputs = deep_parse_json_values(nd.get("outputs", {}))
+                    traces.append({"node": title, "output": outputs})
+                    _log_node(title, outputs)
+
+                elif event in ("agent_message", "message"):
+                    chunk = data.get("answer", "")
+                    if chunk:
+                        answer_parts.append(chunk)
+                    cid = data.get("conversation_id", "")
+                    if cid:
+                        result_cid = cid
+
+                elif event == "message_end":
+                    tokens = data.get("metadata", {}).get("usage", {}).get("total_tokens", "?")
+                    logger.info(f"完成, tokens: {tokens}")
+
+                elif event == "workflow_finished":
+                    logger.info(f"工作流完成: {data.get('data', {}).get('status', '?')}")
+
+                elif event == "error":
+                    logger.error(f"错误: {data.get('message', '?')}")
+
+            full_answer = "".join(answer_parts)
+            logger.info(f"回答: {full_answer[:200]}{'...' if len(full_answer) > 200 else ''}")
+
+            return {"answer": full_answer, "traces": traces, "conversation_id": result_cid}
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Chatflow 请求失败: {e}")
+            return None
+
+
+def create_tester(app_type, api_key, base_url):
+    if app_type == "chatflow":
+        return DifyChatflowTester(api_key=api_key, base_url=base_url)
+    elif app_type == "workflow":
+        return DifyWorkflowTester(api_key=api_key, base_url=base_url)
+    else:
+        raise ValueError(f"不支持的 app_type: {app_type}")

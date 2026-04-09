@@ -209,3 +209,4 @@ __marimo__/
 logs/
 tests/
 conf.ini
+results/.DS_Store
