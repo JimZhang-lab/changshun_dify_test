@@ -211,3 +211,4 @@ tests/
 conf.ini
 results/
 .DS_Store
+.vscode/
