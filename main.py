@@ -26,6 +26,9 @@ def main():
         default="single",
         help="运行模式: single=单例测试(默认), batch=批量评测"
     )
+    parser.add_argument(
+        "--use-llm", action="store_true", help="在 batch 模式下，启用大模型比对评测"
+    )
 
     args = parser.parse_args()
 
@@ -33,7 +36,7 @@ def main():
         from evaluate.evaluate import run_evaluate
         from config.config import cfg, logger
         logger.info(f"批量评测开始 [{cfg.run_timestamp}]")
-        result_path = run_evaluate()
+        result_path = run_evaluate(use_llm_eval=args.use_llm)
         if result_path:
             logger.info(f"批量评测结束: {result_path}")
         else:
