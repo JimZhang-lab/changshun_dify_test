@@ -86,7 +86,7 @@ class DifyWorkflowTester:
             return {"data": {"outputs": final_outputs}, "traces": traces}
 
         except requests.exceptions.RequestException as e:
-            logger.error(f"Workflow 请求失败: {e}")
+            logger.error(f"Workflow 请求失败: {e}, {e.response.text}")
             return None
 
     def run_workflow(self, inputs, user_id="test-user"):

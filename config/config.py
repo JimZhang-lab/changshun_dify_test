@@ -14,7 +14,7 @@ _current_dir = os.path.dirname(os.path.abspath(__file__))
 _project_root = os.path.dirname(_current_dir)
 _config_file = os.path.join(_current_dir, 'conf.ini')
 
-_parser = configparser.ConfigParser()
+_parser = configparser.ConfigParser(inline_comment_prefixes=('#', ';'))
 if not _parser.read(_config_file, encoding='utf-8'):
     raise FileNotFoundError(f"配置文件不存在: {_config_file}")
 
