@@ -1,8 +1,8 @@
 '''
 Author: JimZhang
 Date: 2026-04-09 02:18:56
-LastEditors: 很拉风的James
-LastEditTime: 2026-04-09 16:45:00
+LastEditors: JimZhang
+LastEditTime: 2026-04-10 15:28:00
 FilePath: /changshun_dify_test/evaluate/evaluate.py
 '''
 import os
@@ -14,6 +14,35 @@ import concurrent.futures
 from config.config import cfg, logger
 from config.connect_dify import create_tester
 from config.llm_client import current_api, get_expect_eval_prompt, get_trace_eval_prompt, test_connection
+
+
+def _parse_input(raw_input):
+    """
+    解析 input 列，统一使用 JSON 数组格式。
+    
+    支持格式：
+    1. JSON 数组: '["买复合肥", "第1个", "确认下单"]'
+    2. 纯文本（向后兼容，自动包装为单元素数组）: '买两袋复合肥' → ["买两袋复合肥"]
+    
+    Returns:
+        list[str] 或 None（空输入时）
+    """
+    raw = str(raw_input).strip()
+    if not raw:
+        return None
+
+    # 尝试解析为 JSON 数组
+    if raw.startswith("["):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
+                items = [q.strip() for q in parsed if q.strip()]
+                return items if items else None
+        except json.JSONDecodeError:
+            pass
+
+    # 纯文本 → 自动包装为单元素数组（向后兼容）
+    return [raw]
 
 
 class DifyEvaluator:
@@ -37,7 +66,7 @@ class DifyEvaluator:
             df = df.fillna("")
         except Exception as e:
             logger.error(f"读取 Excel 失败: {e}")
-            return
+            return None
 
         total = len(df)
         success_count = 0
@@ -47,6 +76,8 @@ class DifyEvaluator:
 
         results = [""] * total
         trace_results = [""] * total
+        rounds_list = [0] * total
+        all_answers_list = [""] * total
         eval_expect_opts = [""] * total
         eval_expect_reasons = [""] * total
         eval_trace_opts = [""] * total
@@ -54,17 +85,19 @@ class DifyEvaluator:
 
         def process_row(index, row):
             item_id = row.get("id", index)
-            input_text = str(row.get("input", "")).strip()
+            raw_input = row.get("input", "")
             expect = str(row.get("expect", "")).strip()
             gold_traces = str(row.get("gold_node_traces", "")).strip()
 
-            if not input_text:
-                return index, item_id, None, None, None, False, 0.0, "", "", "", ""
+            input_data = _parse_input(raw_input)
+            if not input_data:
+                return index, item_id, None, None, None, False, 0.0, "", "", "", "", 0, ""
 
+            num_rounds = len(input_data)
             t0 = time.time()
-            predict_text, trace_text = self._process_single(input_text, row)
+            predict_text, trace_text, all_answers = self._process_single(input_data, row)
             elapsed = time.time() - t0
-            ok = predict_text and predict_text != "[请求失败]"
+            ok = bool(predict_text and predict_text != "[请求失败]")
 
             # Run LLM evaluation
             exp_opt, exp_reason = "", ""
@@ -77,7 +110,7 @@ class DifyEvaluator:
                 if gold_traces and ok:
                     trace_opt, trace_reason = self._evaluate_with_llm("trace", gold_traces, trace_text)
 
-            return index, item_id, input_text, predict_text, trace_text, ok, elapsed, exp_opt, exp_reason, trace_opt, trace_reason
+            return index, item_id, input_data, predict_text, trace_text, ok, elapsed, exp_opt, exp_reason, trace_opt, trace_reason, num_rounds, all_answers
 
         # Using ThreadPoolExecutor
         workers = getattr(cfg, 'max_workers', 5)
@@ -92,14 +125,17 @@ class DifyEvaluator:
                 completed += 1
                 try:
                     res = future.result()
-                    index, item_id, input_text, predict_text, trace_text, ok, elapsed, exp_opt, exp_reason, tr_opt, tr_reason = res
+                    (index, item_id, input_data, predict_text, trace_text, ok, elapsed,
+                     exp_opt, exp_reason, tr_opt, tr_reason, num_rounds, all_answers) = res
                     
-                    if input_text is None:
+                    if input_data is None:
                         skip_count += 1
                         continue
 
-                    results[idx] = predict_text
-                    trace_results[idx] = trace_text
+                    results[idx] = predict_text or ""
+                    trace_results[idx] = trace_text or ""
+                    rounds_list[idx] = num_rounds
+                    all_answers_list[idx] = all_answers or ""
                     eval_expect_opts[idx] = exp_opt
                     eval_expect_reasons[idx] = exp_reason
                     eval_trace_opts[idx] = tr_opt
@@ -108,18 +144,20 @@ class DifyEvaluator:
                     success_count += ok
                     fail_count += (not ok)
                     
-                    self._print_test_start(completed, total, item_id, input_text)
-                    self._print_test_result(predict_text, trace_text, elapsed, ok, exp_opt, tr_opt)
+                    self._print_test_start(completed, total, item_id, input_data)
+                    self._print_test_result(predict_text, trace_text, elapsed, ok, exp_opt, tr_opt, num_rounds)
 
                 except Exception as exc:
                     logger.error(f"行 {idx} 处理异常: {exc}")
                     fail_count += 1
 
+        df["rounds"] = rounds_list
         df["predict"] = results
+        df["all_answers"] = all_answers_list
         df["node_traces"] = trace_results
 
         result_path = os.path.join(self.result_dir, f"result_{cfg.run_timestamp}.xlsx")
-        df.to_excel(result_path, index=False)
+        self._safe_to_excel(df, result_path)
 
         if use_llm_eval:
             df["eval_expect_opt"] = eval_expect_opts
@@ -128,7 +166,7 @@ class DifyEvaluator:
             df["eval_trace_reason"] = eval_trace_reasons
 
             compare_path = os.path.join(self.result_dir, f"compare_{cfg.run_timestamp}.xlsx")
-            df.to_excel(compare_path, index=False)
+            self._safe_to_excel(df, compare_path)
             final_path = compare_path
         else:
             final_path = result_path
@@ -136,6 +174,33 @@ class DifyEvaluator:
         total_elapsed = time.time() - start_time
         self._print_summary(total, success_count, skip_count, fail_count, total_elapsed, final_path)
         return final_path
+
+    @staticmethod
+    def _safe_to_excel(df, path):
+        """
+        安全写入 Excel，处理两个潜在问题：
+        1. 以 '=' 开头的字符串会被 Excel/openpyxl 误判为公式 → 前缀空格
+        2. 超过 32767 字符的单元格会被截断 → 主动截断并标注
+        """
+        EXCEL_MAX_CELL = 32767
+        TRUNCATE_SUFFIX = "\n...[内容过长，已截断]"
+
+        df_out = df.copy()
+        for col in df_out.columns:
+            if df_out[col].dtype == object:
+                def sanitize(val):
+                    if not isinstance(val, str):
+                        return val
+                    # 避免 '=' 开头被解析为公式
+                    if val.startswith("="):
+                        val = " " + val
+                    # 截断超长内容
+                    if len(val) > EXCEL_MAX_CELL:
+                        val = val[:EXCEL_MAX_CELL - len(TRUNCATE_SUFFIX)] + TRUNCATE_SUFFIX
+                    return val
+                df_out[col] = df_out[col].map(sanitize)
+
+        df_out.to_excel(path, index=False)
 
     def _evaluate_with_llm(self, mode, gold, actual):
         if mode == "expect":
@@ -177,16 +242,40 @@ class DifyEvaluator:
 
         return option, reason
 
-    def _process_single(self, input_text, row):
+    def _process_single(self, input_data, row):
+        """
+        处理单个测试用例（支持单轮和多轮）。
+        
+        Args:
+            input_data: list[str]，用户输入列表
+            row: DataFrame 行数据
+            
+        Returns:
+            (predict_text, trace_text, all_answers_json)
+        """
         if cfg.app_type == "chatflow":
             inputs = {}
             cid = str(row.get("customer_id", "")).strip()
             if cid:
                 inputs["customer_id"] = cid
-            result = self.tester.run(query=input_text, inputs=inputs)
+
+            if len(input_data) > 1:
+                # 多轮对话
+                result = self.tester.run_multi_turn(queries=input_data, inputs=inputs)
+                return self._parse_multi_turn_result(result)
+            else:
+                # 单轮
+                result = self.tester.run(query=input_data[0], inputs=inputs)
+                predict, trace = self._parse_result(result)
+                all_answers = json.dumps([predict], ensure_ascii=False) if predict else "[]"
+                return predict, trace, all_answers
         else:
-            result = self.tester.run(inputs={"text_input": input_text, "language": "zh-CN"})
-        return self._parse_result(result)
+            # workflow 模式不支持多轮，取第一个输入
+            query = input_data[0]
+            result = self.tester.run(inputs={"text_input": query, "language": "zh-CN"})
+            predict, trace = self._parse_result(result)
+            all_answers = json.dumps([predict], ensure_ascii=False) if predict else "[]"
+            return predict, trace, all_answers
 
     def _parse_result(self, result):
         if not result:
@@ -210,6 +299,45 @@ class DifyEvaluator:
 
         return predict, trace
 
+    def _parse_multi_turn_result(self, result):
+        """
+        解析多轮对话结果。
+        
+        Returns:
+            (predict_text, trace_text, all_answers_json)
+            predict_text: 最后一轮的回答
+            trace_text: 所有轮次的节点轨迹（带轮次标记）
+            all_answers_json: 所有轮次回答的 JSON 字符串
+        """
+        if not result:
+            return "[请求失败]", "", "[]"
+
+        predict = result["final_answer"]
+
+        # 收集所有轮次回答
+        all_answers = []
+        for r in result["rounds"]:
+            all_answers.append(r["answer"])
+
+        # traces：每轮用分隔线标记
+        # 注意：不以 '=' 开头，避免 openpyxl 将其误判为 Excel 公式
+        trace_parts = []
+        for r in result["rounds"]:
+            query_short = r["query"][:30] + ("..." if len(r["query"]) > 30 else "")
+            header = f"----- 第{r['round']}轮: {query_short} -----"
+            if r["traces"]:
+                nodes = []
+                for t in r["traces"]:
+                    formatted = json.dumps(t['output'], ensure_ascii=False, indent=2)
+                    nodes.append(f"[{t['node']}]:\n{formatted}")
+                trace_parts.append(f"{header}\n" + "\n\n".join(nodes))
+            else:
+                trace_parts.append(f"{header}\n[无节点轨迹]")
+
+        trace = "\n\n".join(trace_parts)
+        all_answers_json = json.dumps(all_answers, ensure_ascii=False)
+        return predict, trace, all_answers_json
+
     def _print_header(self, use_llm_eval):
         logger.info(f"读取测试数据: {self.test_data_path}")
         print()
@@ -223,17 +351,24 @@ class DifyEvaluator:
         print(f"  时间戳: {cfg.run_timestamp}")
         print()
 
-    def _print_test_start(self, current, total, item_id, input_text):
+    def _print_test_start(self, current, total, item_id, input_data):
         bar = self._progress_bar(current, total)
         print(f"  进度 [{current}/{total}] {bar}")
         print(f"    ID: {item_id}")
-        short_input = input_text[:30] + "..." if len(input_text) > 30 else input_text
-        print(f"    输入: {short_input}")
+        if isinstance(input_data, list) and len(input_data) > 1:
+            short_first = input_data[0][:20] + ("..." if len(input_data[0]) > 20 else "")
+            short_last = input_data[-1][:20] + ("..." if len(input_data[-1]) > 20 else "")
+            print(f"    输入: [{short_first} → ... → {short_last}] ({len(input_data)}轮)")
+        else:
+            text = input_data[0] if isinstance(input_data, list) else str(input_data)
+            short_input = text[:30] + "..." if len(text) > 30 else text
+            print(f"    输入: {short_input}")
 
-    def _print_test_result(self, predict_text, trace_text, elapsed, success, exp_opt, tr_opt):
+    def _print_test_result(self, predict_text, trace_text, elapsed, success, exp_opt, tr_opt, num_rounds=1):
         status = "OK" if success else "FAIL"
+        rounds_info = f" ({num_rounds}轮)" if num_rounds > 1 else ""
         llm_status = f" | Expect: {exp_opt or 'N/A'} | Trace: {tr_opt or 'N/A'}"
-        print(f"    结果: {status}  耗时 {elapsed:.2f}s{llm_status}")
+        print(f"    结果: {status}{rounds_info}  耗时 {elapsed:.2f}s{llm_status}")
         print(f"  {'-'*40}")
         print()
 
