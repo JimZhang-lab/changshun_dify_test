@@ -160,6 +160,64 @@ class DifyChatflowTester:
             logger.error(f"Chatflow 请求失败: {e}")
             return None
 
+    def run_multi_turn(self, queries, inputs=None, user_id="abc-123"):
+        """
+        执行多轮对话，依次发送 queries 列表中的每条消息。
+        每轮复用上一轮返回的 conversation_id 以保持对话上下文。
+
+        Args:
+            queries: 用户输入列表，每个元素代表一轮对话
+            inputs: 额外输入参数（如 customer_id），每轮都传入（Dify 要求）
+            user_id: 用户标识
+
+        Returns:
+            {
+                "rounds": [{"round": 1, "query": "...", "answer": "...", "traces": [...], "conversation_id": "...", "elapsed": 1.23}, ...],
+                "final_answer": "最后一轮的 answer",
+                "final_traces": [...],
+                "all_traces": [...],
+                "conversation_id": "最终的 conversation_id"
+            }
+            或 None（某轮失败时）
+        """
+        import time
+        conversation_id = ""
+        rounds = []
+
+        for i, query in enumerate(queries):
+            round_num = i + 1
+            logger.info(f"  多轮对话 [{round_num}/{len(queries)}]: {query[:50]}")
+
+            t0 = time.time()
+            # Dify 要求每轮都传入 inputs（如 customer_id），否则返回 400
+            result = self.run(
+                query=query, inputs=inputs or {},
+                user_id=user_id, conversation_id=conversation_id
+            )
+            elapsed = time.time() - t0
+
+            if not result:
+                logger.error(f"  多轮对话第 {round_num} 轮失败，终止后续轮次")
+                return None
+
+            conversation_id = result.get("conversation_id", "")
+            rounds.append({
+                "round": round_num,
+                "query": query,
+                "answer": result.get("answer", ""),
+                "traces": result.get("traces", []),
+                "conversation_id": conversation_id,
+                "elapsed": elapsed
+            })
+
+        return {
+            "rounds": rounds,
+            "final_answer": rounds[-1]["answer"] if rounds else "",
+            "final_traces": rounds[-1]["traces"] if rounds else [],
+            "all_traces": [t for r in rounds for t in r["traces"]],
+            "conversation_id": conversation_id
+        }
+
 
 def create_tester(app_type, api_key, base_url):
     if app_type == "chatflow":
