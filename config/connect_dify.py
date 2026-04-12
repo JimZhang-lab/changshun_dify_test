@@ -2,16 +2,17 @@
 Author: JimZhang
 Date: 2026-04-09 02:18:35
 LastEditors: JimZhang
-LastEditTime: 2026-04-09 13:27:00
+LastEditTime: 2026-04-12 16:12:00
 FilePath: /changshun_dify_test/config/connect_dify.py
 '''
+import time
 import requests
 import json
 from .config import logger
 
 
 def deep_parse_json_values(obj):
-    """递归展开嵌套的 JSON 字符串值"""
+    """递归解析展开 JSON 嵌套字符串"""
     if isinstance(obj, dict):
         return {k: deep_parse_json_values(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -28,7 +29,7 @@ def deep_parse_json_values(obj):
 
 
 def _parse_sse_lines(resp):
-    """从 SSE 响应中逐行解析 JSON 数据"""
+    """遍历解析 SSE 数据流行"""
     for line in resp.iter_lines():
         if not line:
             continue
@@ -46,7 +47,8 @@ def _log_node(title, outputs):
     logger.debug(f"  [{title}] 输出:\n{json.dumps(outputs, ensure_ascii=False, indent=2)}")
 
 
-class DifyWorkflowTester:
+class _DifyBaseTester:
+    """Dify 接口基类参数注入"""
 
     def __init__(self, api_key, base_url="https://api.dify.ai/v1"):
         self.api_key = api_key
@@ -55,6 +57,9 @@ class DifyWorkflowTester:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
+
+
+class DifyWorkflowTester(_DifyBaseTester):
 
     def run(self, inputs, user_id="test-user"):
         payload = {
@@ -89,19 +94,8 @@ class DifyWorkflowTester:
             logger.error(f"Workflow 请求失败: {e}")
             return None
 
-    def run_workflow(self, inputs, user_id="test-user"):
-        return self.run(inputs=inputs, user_id=user_id)
 
-
-class DifyChatflowTester:
-
-    def __init__(self, api_key, base_url="https://api.dify.ai/v1"):
-        self.api_key = api_key
-        self.base_url = base_url.rstrip('/')
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
+class DifyChatflowTester(_DifyBaseTester):
 
     def run(self, query, inputs=None, user_id="abc-123", conversation_id=""):
         payload = {
@@ -115,7 +109,7 @@ class DifyChatflowTester:
         try:
             resp = requests.post(
                 f"{self.base_url}/chat-messages",
-                headers=self.headers, data=json.dumps(payload), stream=True
+                headers=self.headers, json=payload, stream=True
             )
             resp.raise_for_status()
 
@@ -161,26 +155,7 @@ class DifyChatflowTester:
             return None
 
     def run_multi_turn(self, queries, inputs=None, user_id="abc-123"):
-        """
-        执行多轮对话，依次发送 queries 列表中的每条消息。
-        每轮复用上一轮返回的 conversation_id 以保持对话上下文。
-
-        Args:
-            queries: 用户输入列表，每个元素代表一轮对话
-            inputs: 额外输入参数（如 customer_id），每轮都传入（Dify 要求）
-            user_id: 用户标识
-
-        Returns:
-            {
-                "rounds": [{"round": 1, "query": "...", "answer": "...", "traces": [...], "conversation_id": "...", "elapsed": 1.23}, ...],
-                "final_answer": "最后一轮的 answer",
-                "final_traces": [...],
-                "all_traces": [...],
-                "conversation_id": "最终的 conversation_id"
-            }
-            或 None（某轮失败时）
-        """
-        import time
+        """按序发起多轮对话并用 conversation_id 维系同一次会话"""
         conversation_id = ""
         rounds = []
 
