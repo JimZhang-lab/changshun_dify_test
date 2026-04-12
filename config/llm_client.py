@@ -28,16 +28,7 @@ def current_api(
     question: str,
     system_prompt: str = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
 ) -> str:
-    """
-    调用 LLM API 获取响应
-    
-    Args:
-        question: 用户问题
-        system_prompt: 系统提示词
-    
-    Returns:
-        模型响应文本
-    """
+    """根据配置分发 HTTP 或 SDK 的大模型调用"""
     if cfg.eval_client_method == "requests":
         return _call_api_with_requests(question, system_prompt)
     return _call_api_with_openai(question, system_prompt)
@@ -123,7 +114,7 @@ def _call_api_with_requests(question: str, system_prompt: str) -> str:
 
 
 def get_expect_eval_prompt(gold: str, actual: str):
-    """生成用来评估期望结果与实际结果的 prompt 和 sys_prompt"""
+    """装配预期结果比对评测提示词"""
     sys_prompt = "你是一个专业的评测专家。你需要对比两段文本的语义是否一致。"
     prompt = (
         f"对比以下两段文本是否一致。\n"
@@ -137,7 +128,7 @@ def get_expect_eval_prompt(gold: str, actual: str):
 
 
 def get_trace_eval_prompt(gold: str, actual: str):
-    """生成用来评估期望轨迹和执行轨迹的 prompt 和 sys_prompt"""
+    """装配执行轨迹比对评测提示词"""
     sys_prompt = "你是一个专业的AI评测专家。你需要对比两段执行轨迹(Node Traces)的逻辑和执行节点是否一致。"
     prompt = (
         f"对比以下两段执行轨迹信息。\n"
