@@ -75,6 +75,7 @@ class DifyEvaluator:
 
         results = [""] * total
         trace_results = [""] * total
+        simplify_trace_results = [""] * total
         rounds_list = [0] * total
         all_answers_list = [""] * total
         eval_expect_opts = [""] * total
@@ -91,11 +92,11 @@ class DifyEvaluator:
 
             input_data = _parse_input(raw_input)
             if not input_data:
-                return index, item_id, None, None, None, False, 0.0, "", "", "", "", 0, ""
+                return index, item_id, None, None, None, None, False, 0.0, "", "", "", "", 0, ""
 
             num_rounds = len(input_data)
             t0 = time.time()
-            predict_text, trace_text, all_answers = self._process_single(input_data, row)
+            predict_text, trace_text, all_answers, simplify_trace_text = self._process_single(input_data, row)
             elapsed = time.time() - t0
             ok = bool(predict_text and predict_text != "[请求失败]")
 
@@ -108,9 +109,9 @@ class DifyEvaluator:
                     exp_opt, exp_reason = self._evaluate_with_llm("expect", expect, predict_text)
                 
                 if gold_traces and ok:
-                    trace_opt, trace_reason = self._evaluate_with_llm("trace", gold_traces, trace_text)
+                    trace_opt, trace_reason = self._evaluate_with_llm("trace", gold_traces, simplify_trace_text)
 
-            return index, item_id, input_data, predict_text, trace_text, ok, elapsed, exp_opt, exp_reason, trace_opt, trace_reason, num_rounds, all_answers
+            return index, item_id, input_data, predict_text, trace_text, simplify_trace_text, ok, elapsed, exp_opt, exp_reason, trace_opt, trace_reason, num_rounds, all_answers
 
         # 并发执行
         workers = getattr(cfg, 'max_workers', 5)
@@ -125,7 +126,7 @@ class DifyEvaluator:
                 completed += 1
                 try:
                     res = future.result()
-                    (index, item_id, input_data, predict_text, trace_text, ok, elapsed,
+                    (index, item_id, input_data, predict_text, trace_text, simplify_trace_text, ok, elapsed,
                      exp_opt, exp_reason, tr_opt, tr_reason, num_rounds, all_answers) = res
                     
                     if input_data is None:
@@ -135,6 +136,7 @@ class DifyEvaluator:
 
                     results[idx] = predict_text or ""
                     trace_results[idx] = trace_text or ""
+                    simplify_trace_results[idx] = simplify_trace_text or ""
                     rounds_list[idx] = num_rounds
                     all_answers_list[idx] = all_answers or ""
                     eval_expect_opts[idx] = exp_opt
@@ -157,6 +159,7 @@ class DifyEvaluator:
         df["rounds"] = rounds_list
         df["predict"] = results
         df["all_answers"] = all_answers_list
+        df["simplify_node_traces"] = simplify_trace_results
         df["node_traces"] = trace_results
 
         result_path = os.path.join(self.result_dir, f"result_{cfg.run_timestamp}.xlsx")
@@ -277,7 +280,7 @@ class DifyEvaluator:
         logger.info(f"加载测试数据: {len(df)} 条 (来自 {os.path.basename(path)})")
         return df
 
-    _OVERFLOW_COLUMNS = {'node_traces', 'all_answers'}
+    _OVERFLOW_COLUMNS = {'node_traces', 'simplify_node_traces', 'all_answers'}
 
     @staticmethod
     def _split_long_text(text, max_len=32767):
@@ -492,20 +495,20 @@ class DifyEvaluator:
             else:
                 # 单轮
                 result = self.tester.run(query=input_data[0], inputs=inputs)
-                predict, trace = self._parse_result(result)
+                predict, trace, simplify_trace = self._parse_result(result)
                 all_answers = json.dumps([predict], ensure_ascii=False) if predict else "[]"
-                return predict, trace, all_answers
+                return predict, trace, all_answers, simplify_trace
         else:
             # workflow 模式不支持多轮，取第一个输入
             query = input_data[0]
             result = self.tester.run(inputs={"text_input": query, "language": "zh-CN"})
-            predict, trace = self._parse_result(result)
+            predict, trace, simplify_trace = self._parse_result(result)
             all_answers = json.dumps([predict], ensure_ascii=False) if predict else "[]"
-            return predict, trace, all_answers
+            return predict, trace, all_answers, simplify_trace
 
     def _parse_result(self, result):
         if not result:
-            return "[请求失败]", ""
+            return "[请求失败]", "", ""
 
         if "answer" in result:
             predict = result["answer"]
@@ -516,19 +519,23 @@ class DifyEvaluator:
             predict = str(result)
 
         trace = ""
+        simplify_trace = ""
         if result.get("traces"):
             parts = []
+            nodes = []
             for t in result["traces"]:
                 formatted = json.dumps(t['output'], ensure_ascii=False, indent=2)
                 parts.append(f"[{t['node']}]:\n{formatted}")
+                nodes.append(t['node'])
             trace = "\n\n".join(parts)
+            simplify_trace = " -> ".join(nodes)
 
-        return predict, trace
+        return predict, trace, simplify_trace
 
     def _parse_multi_turn_result(self, result):
         """解析多轮对话结果为文本特征与原始输出"""
         if not result:
-            return "[请求失败]", "", "[]"
+            return "[请求失败]", "", "[]", ""
 
         predict = result["final_answer"]
 
@@ -540,21 +547,27 @@ class DifyEvaluator:
         # traces：每轮用分隔线标记
         # 注意：不以 '=' 开头，避免 openpyxl 将其误判为 Excel 公式
         trace_parts = []
+        simplify_trace_parts = []
         for r in result["rounds"]:
             query_short = r["query"][:30] + ("..." if len(r["query"]) > 30 else "")
             header = f"----- 第{r['round']}轮: {query_short} -----"
             if r["traces"]:
                 nodes = []
+                simp_nodes = []
                 for t in r["traces"]:
                     formatted = json.dumps(t['output'], ensure_ascii=False, indent=2)
                     nodes.append(f"[{t['node']}]:\n{formatted}")
+                    simp_nodes.append(t['node'])
                 trace_parts.append(f"{header}\n" + "\n\n".join(nodes))
+                simplify_trace_parts.append(f"{header}\n" + " -> ".join(simp_nodes))
             else:
                 trace_parts.append(f"{header}\n[无节点轨迹]")
+                simplify_trace_parts.append(f"{header}\n[无节点轨迹]")
 
         trace = "\n\n".join(trace_parts)
+        simplify_trace = "\n\n".join(simplify_trace_parts)
         all_answers_json = json.dumps(all_answers, ensure_ascii=False)
-        return predict, trace, all_answers_json
+        return predict, trace, all_answers_json, simplify_trace
 
     def _print_header(self, use_llm_eval, categories=None):
         logger.info(f"读取测试数据: {self.test_data_path}")
