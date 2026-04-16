@@ -1,6 +1,15 @@
 # 长顺农服 Dify 测试工具
 
-针对长顺农服 Dify 应用的自动化测试工具，支持 Chatflow 和 Workflow 两种模式。提供交互式单例测试和批量评测两种运行方式，能够追踪每个节点的执行过程并自动解析嵌套 JSON 输出。
+针对长顺农服 Dify 应用的自动化测试工具，支持 Chatflow 和 Workflow 两种模式。包含单例测试和批量评测功能，支持多轮对话测试、多 Sheet 格式的数据文件，并提供处理超长节点日志的跨列扩展功能。
+
+## 核心特性
+
+- **多轮对话测试**：基于 `conversation_id` 自动串联上下文，还原真实场景。
+- **交互式选择**：执行批量测试时，可在终端直接选择想要执行的测试数据所属分类。
+- **多 Sheet 报告输出**：根据数据表内 `classified` 字段自动切分测试结果至对应的 Sheet 中，并生成一份汇总的 `ALL` Sheet。
+- **自动化统计结果**：评测结束后在命令行打印整体的成功数、失败数、跳过数及分类通过率。
+- **第三方大模型评测辅助**：配置第三方 LLM API 后，可自动对 Dify 实际输出回复或执行节点与测试集期望值进行对比打分。
+- **Excel 列防截断**：解决 Excel 单个单元格最大 32,767 字符的渲染限制。超过该限制长度的节点日志（如节点 Trace），会在输出报告时拆分写入旁侧的 `node_traces_2`, `node_traces_3` 等新列中。
 
 ## 目录结构
 
@@ -8,27 +17,20 @@
 changshun_dify_test/
 ├── main.py                          # 入口文件，调度单例测试和批量评测
 ├── config/
-│   ├── __init__.py
 │   ├── conf.ini                     # 配置文件（含 API Key，不提交到仓库）
 │   ├── conf copy.ini                # 配置文件模板（用于新环境初始化）
 │   ├── config.py                    # 配置读取，统一管理所有配置项和日志初始化
-│   └── connect_dify.py              # Dify API 连接器，Chatflow/Workflow 测试器实现
+│   ├── connect_dify.py              # Dify API 连接器，Chatflow/Workflow 测试器实现
+│   └── llm_client.py                # LLM 评估客户端（OpenAI SDK / requests）支持连通性快速校验
 ├── evaluate/
-│   ├── __init__.py
-│   ├── evaluate.py                  # 批量评测逻辑，读取 Excel 数据，逐条测试并输出结果
-│   └── single_test.py               # 交互式单例测试，支持多轮对话和节点追踪
+│   ├── evaluate.py                  # 批量评测核心逻辑：多轮解析、LLM对齐打分、按 sheet 提取生成/防截断导出
+│   └── single_test.py               # 交互式单例测试，支持多轮对话和节点追踪预览
 ├── data/
-│   └── chatflow_test_data.xlsx      # 测试数据（Excel 格式）
-├── results/                         # 评测结果输出目录（自动创建）
-│   └── result_MMDDHHMMSS.xlsx       # 带时间戳的评测结果文件
-├── logs/                            # 日志输出目录（自动创建）
-│   └── app_MMDDHHMMSS.log          # 带时间戳的日志文件
-├── scripts/
-│   ├── start_evaluate.sh            # 批量评测启动脚本
-│   └── siege.sh                     # 压测脚本（预留）
-├── .gitignore
-├── LICENSE
-└── README.md
+│   └── chatflow_multi_turn_test_data.xlsx  # 包含多 Sheet 支持与 classified 字段格式测试数据
+├── results/                         # 评测结果多表输出目录（带时间戳）
+├── logs/                            # 各级别日志输出目录
+├── tests/                           # 各类调试及单向性单元集测试脚本
+└── scripts/                         # 系统辅助脚本
 ```
 
 ## 环境准备
@@ -36,7 +38,7 @@ changshun_dify_test/
 ### 依赖安装
 
 ```bash
-pip install requests pandas openpyxl
+pip install requests pandas openpyxl openai
 ```
 
 ### 配置文件
@@ -50,21 +52,29 @@ cp config/conf\ copy.ini config/conf.ini
 编辑 `config/conf.ini`：
 
 ```ini
-[log]
-level = INFO
-console_level = INFO       # 控制台日志级别，可选 DEBUG/INFO/WARNING
-file_level = DEBUG          # 文件日志级别，DEBUG 会记录每个节点的完整 JSON 输出
-target = both               # 日志输出目标：console / file / both
-file_path = logs/app.log    # 日志文件路径模板，实际文件名会追加时间戳
+[LOG]
+CONSOLE_LEVEL = INFO        # 控制台日志级别，可选 DEBUG/INFO/WARNING
+FILE_LEVEL = DEBUG          # 文件日志级别，DEBUG 会记录每个节点的完整 JSON 输出
+TARGET = both               # 日志输出目标：console / file / both
+FILE_PATH = logs/app.log    # 日志文件路径模板，实际文件名会追加时间戳
 
-[evaluate]
-test_file_path = data/chatflow_test_data.xlsx   # 测试数据文件路径
-result_dir = results                             # 结果输出目录
+[EVALUATE]
+TEST_FILE_PATH = data/chatflow_multi_turn_test_data.xlsx  # 测试数据文件路径
+RESULT_DIR = results                                      # 结果输出目录
+MAX_WORKERS = 1             # 并行线程数（多轮对话建议设为 1 以确保顺序追踪）
 
-[Dify]
-api_key = app-xxxxxxxxxxxxxxxxxxxxxxxx           # Dify 应用 API Key
-base_url = https://api.dify.ai/v1                # Dify API 地址
-app_type = chatflow                              # 应用类型：chatflow 或 workflow
+[DIFY]
+API_KEY = app-xxxxxxxxxxxxxxxxxxxxxxxx    # Dify 应用 API Key
+BASE_URL = https://api.dify.ai/v1         # Dify API 地址
+APP_TYPE = chatflow                       # 应用类型：chatflow 或 workflow
+
+[EVAL_LLM]
+CLIENT_METHOD = openai       # LLM 调用方式：openai 或 requests
+API_KEY = sk-xxx             # 评估用 LLM 的 API Key
+BASE_URL = http://xxx/v1/    # 评估用 LLM 的 API 地址
+MODEL_NAME = qwen3-14b       # 模型名称
+MAX_TOKEN = 20480
+TEMPERATURE = 0
 ```
 
 > 路径支持相对路径和绝对路径。相对路径基于项目根目录解析。
@@ -73,7 +83,7 @@ app_type = chatflow                              # 应用类型：chatflow 或 w
 
 ### 单例测试（交互式）
 
-启动后进入交互模式，输入提示词即可查看完整的节点执行轨迹和最终回答。Chatflow 模式下支持多轮对话。
+启动后进入交互模式，输入提示词即可查看完整的节点执行轨迹和最终回答。Chatflow 模式下支持多轮对话串联。
 
 ```bash
 python main.py
@@ -81,117 +91,77 @@ python main.py
 python main.py --mode single
 ```
 
-运行示例：
-
-```
-  请输入提示词: 买三包化肥
-  customer_id (回车跳过): 11111
-
-  节点轨迹 (14 个节点):
-  +-- [1/14] 用户输入
-  |     { "sys.query": "买三包化肥", ... }
-  +-- [2/14] 路由判断
-  |     { "text": { "intent": "SHOPPING", "confidence": 99 } }
-  ...
-  +-- 全部 14 个节点执行完毕
-
-  回答:
-  我找到这些商品，您可以回复'第几个商品'继续查看：
-  1. 赤天化尿素（95元/袋，库存212）
-  2. 西洋复合肥（15:15:15）（142.5元/袋，库存195）
-  ...
-```
-
 输入 `quit`、`q` 或 `exit` 退出。
 
 ### 批量评测
 
-从 Excel 文件读取测试用例，逐条发送请求，将预测结果和节点轨迹写入结果文件。
+从已配置的测试数据表格中读取用例数据，并发执行。完成后将各分类结果按 Sheet 格式写入输出目录下的新 Excel 文件中。
+
+#### 交互式启动：
+
+若直接启动时不传递类别参数，程序会在终端列出所有发现的分类供用户输入序号进行选择：
 
 ```bash
 python main.py --mode batch
-# 或
-bash scripts/start_evaluate.sh
 ```
 
-评测完成后，结果保存在 `results/result_MMDDHHMMSS.xlsx`，日志保存在 `logs/app_MMDDHHMMSS.log`。
+#### 命令行自动启：
+
+支持在命令行直接传入要测试的分类名称（或输入 `ALL` 测试全部数据）：
+
+```bash
+python main.py --mode batch -c SHOPPING PLOT
+# 若需启用大模型对比校验打分：
+python main.py --mode batch --use-llm
+```
+
+评测完成后，结果默认保存在 `results/result_MMDDHHMMSS.xlsx` 文件中，同时终端会输出各分类相关的统计信息与整体通过率。
 
 ## 测试数据格式
 
-测试数据为 Excel 文件，必须包含以下列：
+测试数据应使用 Excel 文件（`.xlsx`），建议使用 `classified` 列对数据进行规划分类，以支持拆分输出多 Sheet 结构。
+多轮对话测试用例需要 `input` 列为 **JSON 数组格式**，普通单轮文本用例向后兼容纯文本字符串格式。
 
-| 列名                 | 必填 | 说明                                             |
-| -------------------- | ---- | ------------------------------------------------ |
-| `id`               | 是   | 测试用例编号                                     |
-| `input`            | 是   | 用户输入的提示词                                 |
-| `expect`           | 否   | 期望的回答（用于人工比对）                       |
-| `gold_node_traces` | 否   | 期望的节点执行路径（用于人工比对）               |
-| `customer_id`      | 否   | Chatflow 模式下的客户 ID（作为 inputs 参数传入） |
+### 多轮对话示例
 
-批量评测后，会在 Excel 中追加两列：
+| id | classified | input                                           | expect       | customer_id |
+| -- | ---------- | ----------------------------------------------- | ------------ | ----------- |
+| 1  | SHOPPING   | `["买两袋复合肥", "就选第1个吧", "确认下单"]` | 确认已下单。 | 201166...   |
+| 2  | PLOT       | `["帮我看看地块情况"]`                        | CHAT         | 201166...   |
 
-| 列名            | 说明                            |
-| --------------- | ------------------------------- |
-| `predict`     | Dify 返回的实际回答             |
-| `node_traces` | 各节点的完整输出（格式化 JSON） |
+### 评测输出结果列名说明
 
-## 文件说明
+在**不使用 LLM 评测**（默认带模式运行的 `main.py --mode batch`）时，生成的结果文件名为 `result_YYYYMMDDHHMMSS.xlsx`。此时，系统除了保留输入表格中自带的所有列外，会向右补充输出以下内容：
 
-### config/config.py
+| 列名                   | 说明                                                                                                                                                         |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `rounds`             | 该测试请求发生的实际对话轮次数                                                                                                                               |
+| `predict`            | 最后一轮 Dify 返回的文本回复结果                                                                                                                             |
+| `all_answers`        | 所有轮次的回复内容集合 JSON 数组（遇到单单元格过长时，会自动向后续相邻列扩展）                                                                               |
+| `simplify_node_traces`| 节点流转的简化轨迹图（例如 `[Start] -> [LLM] -> [End]`），仅保留节点名称记录。                                                                               |
+| `node_traces`        | 包含运行中各节点原始详情输出的完整 JSON 日志。`<br>`为了避免被 Excel 的 32,767 字数限制截断，当排版超长时内容会被自动推拉切割，写入紧随其后的 `node_traces_2`/3 等新列中。|
 
-统一配置管理。从 `conf.ini` 读取所有配置项并封装为 `Config` 类的实例 `cfg`。负责路径解析（相对路径转绝对路径）、目录自动创建、日志初始化。
+<br>
 
-导出：
+在**开启 LLM 评测**（包含 `--use-llm`）时，系统会在记录完实际跑出结果之后，调用外部配置的大模型与测试用例设定好的 `expect` 及 `gold_node_traces` 期望预留值进行交叉比对与打分。输出的新文件则带有 `compare_` 前缀。此时会额外再往右补充以下列：
 
-- `cfg` — 配置实例，通过 `cfg.api_key`、`cfg.base_url` 等访问
-- `logger` — 全局日志对象，控制台和文件使用独立的日志级别
+| 列名                   | 说明                                                                                                                                                         |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `eval_expect_opt`    | 文本预期结果的大模型判定结论（基于 `expect` 列对比 `predict` 列得出）：一致 / 基本一致 / 不一致                                                              |
+| `eval_expect_reason` | 大模型评估当前文本回复预期的详细解析过程与理由                                                                                                               |
+| `eval_trace_opt`     | 执行轨迹路线的大模型判定结论（基于 `gold_node_traces` 对比 `simplify_node_traces` 简化路线图得出）：一致 / 基本一致 / 不一致                                 |
+| `eval_trace_reason`  | 大模型评判此处流程执行路线合规性的详细思考过程和理由                                                                                                         |
 
-### config/connect_dify.py
+### 文件说明
 
-Dify API 连接器。包含：
-
-- `DifyChatflowTester` — Chatflow 测试器，调用 `/v1/chat-messages`，SSE 流式解析
-- `DifyWorkflowTester` — Workflow 测试器，调用 `/v1/workflows/run`，SSE 流式解析
-- `deep_parse_json_values()` — 递归解析嵌套的 JSON 字符串值，将 `"{\"key\":\"val\"}"` 展开为原生 dict
-- `create_tester()` — 工厂函数，根据 `app_type` 创建对应的测试器实例
-
-### evaluate/evaluate.py
-
-批量评测执行器 `DifyEvaluator`，流程：读取 Excel → 逐条发送请求 → 收集结果和节点轨迹 → 写入带时间戳的结果文件。
-
-### evaluate/single_test.py
-
-交互式单例测试。在命令行输入提示词后，展示每个节点的执行输出和最终回答。Chatflow 模式下自动维护 `conversation_id` 实现多轮对话。
-
-### tests/test.py
-
-原始的 API 调用测试脚本，用于直接调试 Dify 接口。不依赖项目模块，可独立运行。
+- **`config.py`** — 配置读取逻辑与基础日志行为的初始化。
+- **`connect_dify.py`** — 处理目标 Dify 服务的直接请求调用以及流式（SSE）结果解析回包。
+- **`evaluate.py`** — 包含运行读取、循环调度、统计日志采集与结果表的防截断拆列写入重组。
+- **`llm_client.py`** — 对接第三方 OpenAI 标准模型与 API 响应，作为文本与流程验证测试使用的中间工具。
 
 ## 日志说明
 
-日志分两路输出，级别独立控制：
-
-- **控制台** — 默认 `INFO` 级别，只显示节点名称和关键状态信息
-- **日志文件** — 默认 `DEBUG` 级别，记录每个节点的完整 JSON 输出
-
-日志文件示例（DEBUG 级别）：
-
-```
-2026-04-09 13:30:59 - INFO -   节点 -> [用户输入]
-2026-04-09 13:30:59 - DEBUG -   [用户输入] 输出:
-{
-  "customer_id": "11111",
-  "sys.query": "买三包化肥",
-  "sys.dialogue_count": 1
-}
-2026-04-09 13:31:03 - INFO -   节点 -> [路由判断]
-2026-04-09 13:31:03 - DEBUG -   [路由判断] 输出:
-{
-  "text": {
-    "intent": "SHOPPING",
-    "confidence": 99
-  }
-}
-```
-
-如需在控制台也查看完整 JSON，将 `conf.ini` 中的 `console_level` 改为 `DEBUG`。
+系统提供配置项，支持将日志分别定向到终端控制台与生成的本地日记文件中：
+- 默认设置下，终端主要以 `INFO` 级别即时输出流程节点跳动与表格类统计概要，反馈直观执行情况。
+- 如果需要细查如原始网络报文级别的调试信息，可以查阅 `logs/` 目录中的日志文件，该内录留了底层节点的冗长 `DEBUG` 日志。
+可在 `config.ini` 中的 `[LOG]` 中分别调节相关开关项级别进行个性定制。
